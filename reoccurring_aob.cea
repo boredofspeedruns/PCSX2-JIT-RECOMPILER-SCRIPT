@@ -1,0 +1,252 @@
+[ENABLE]
+{$lua}
+if syntaxcheck then return end
+
+local pattern = {0x3C,0x44,0x89,0x44,0x0D,0x00,0x89,0xD9,0x89}
+local ee = getAddressSafe("EEMem")
+if not ee then
+   print("EEMem not found")
+   return
+end
+
+local scanStart = ee + 0x45000000
+local scanEnd   = ee + 0x47000000
+
+local chunkSize = 0x100000
+local interval  = 200
+
+local function findPatternInBlock(base, bytes)
+  local plen = #pattern
+
+  for i = 1, #bytes - plen + 1 do
+    local ok = true
+
+    for j = 1, plen do
+      if bytes[i+j-1] ~= pattern[j] then
+        ok = false
+        break
+      end
+    end
+
+    if ok then
+      return base + i - 1
+    end
+  end
+end
+
+local function isHookStillValid()
+  if not _G.PatternAddress then
+    print("No active hook")
+    return false
+  end
+
+  local b = readBytes(_G.PatternAddress + 1, 1)
+
+  if b == 0xE9 then
+    print(string.format(
+      "Hook still valid at %X",
+      _G.PatternAddress
+    ))
+    return true
+  end
+
+  print(string.format(
+    "Hook lost at %X",
+    _G.PatternAddress
+  ))
+
+  return false
+end
+
+local function inject(found)
+  print(string.format(
+    "Attempting injection at %X",
+    found
+  ))
+
+  local enableAA = string.format([[
+define(GetHit,%X)
+
+alloc(newmem,$1000,GetHit)
+
+label(return)
+label(DamageStore)
+label(HPStore)
+
+registersymbol(GetHit)
+registersymbol(DamageStore)
+registersymbol(HPStore)
+
+newmem:
+  push rax
+
+  mov eax,[rbp+rcx+00]
+  sub eax,r8d
+  mov [DamageStore],eax
+
+  pop rax
+
+  mov [rbp+rcx+00],r8d
+  mov [HPStore],r8d
+  jmp return
+
+DamageStore:
+  dd 0
+
+HPStore:
+  dd 0
+
+GetHit+01:
+  jmp newmem
+return:
+]], found)
+
+  if autoAssemble(enableAA) then
+    _G.PatternAddress = found
+    _G.PatternInjected = true
+
+    print(string.format(
+      "Pattern hook enabled at %X",
+      found
+    ))
+
+    return true
+  end
+
+  print(string.format(
+    "Injection failed at %X",
+    found
+  ))
+
+  return false
+end
+
+local function disableCurrentHook()
+  if not _G.PatternInjected then
+    print("No hook to disable")
+    return
+  end
+
+  print(string.format(
+    "Disabling hook at %X",
+    _G.PatternAddress or 0
+  ))
+
+  autoAssemble([[
+GetHit+01:
+  db 44 89 44 0D 00
+
+unregistersymbol(HPStore)
+unregistersymbol(DamageStore)
+unregistersymbol(GetHit)
+
+dealloc(newmem)
+]])
+
+  _G.PatternInjected = false
+  _G.PatternAddress = nil
+end
+
+if _G.PatternTimer then
+  print("Destroying old timer")
+  _G.PatternTimer.destroy()
+end
+
+_G.PatternScanPos = scanStart
+_G.PatternInjected = false
+_G.PatternAddress = nil
+
+print(string.format(
+  "Starting scan: %X - %X",
+  scanStart,
+  scanEnd
+))
+
+_G.PatternTimer = createTimer(nil, false)
+_G.PatternTimer.Interval = interval
+
+_G.PatternTimer.OnTimer = function(t)
+  t.Enabled = false
+
+  local pos = _G.PatternScanPos
+  local readSize = chunkSize + #pattern
+
+  local percent =
+    ((pos - scanStart) / (scanEnd - scanStart)) * 100
+
+  print(string.format(
+    "Scanning chunk: %X - %X (%.2f%%)",
+    pos,
+    pos + chunkSize,
+    percent
+  ))
+
+  local bytes = readBytes(pos, readSize, true)
+
+  if bytes then
+    local found = findPatternInBlock(pos, bytes)
+
+    if found then
+      print(string.format(
+        "Pattern found at %X",
+        found
+      ))
+
+      if found ~= _G.PatternAddress then
+        print("New hook candidate detected")
+
+        if not isHookStillValid() then
+          disableCurrentHook()
+          inject(found)
+        end
+      end
+    end
+  else
+    print(string.format(
+      "readBytes failed at %X",
+      pos
+    ))
+  end
+
+  _G.PatternScanPos = pos + chunkSize
+
+  if _G.PatternScanPos >= scanEnd then
+    _G.PatternScanPos = scanStart
+    print("Restarting scan window")
+  end
+
+  if _G.PatternTimer then
+    t.Enabled = true
+  end
+end
+
+_G.PatternTimer.Enabled = true
+{$asm}
+
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+
+print("Disabling Pattern scanner")
+
+if _G.PatternTimer then
+  _G.PatternTimer.destroy()
+  _G.PatternTimer = nil
+end
+
+autoAssemble([[
+GetHit+01:
+  db 44 89 44 0D 00
+
+unregistersymbol(HPStore)
+unregistersymbol(DamageStore)
+unregistersymbol(GetHit)
+
+dealloc(newmem)
+]])
+
+_G.PatternInjected = false
+_G.PatternAddress = nil
+
+print("Pattern scanner disabled")
+{$asm}
