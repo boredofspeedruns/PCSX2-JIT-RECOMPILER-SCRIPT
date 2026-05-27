@@ -1,0 +1,167 @@
+[ENABLE]
+{$lua}
+if syntaxcheck then return end
+
+local pattern = {0x3C,0x44,0x89,0x44,0x0D,0x00,0x89,0xD9,0x89}
+local ee = getAddressSafe("EEMem")
+if not ee then
+   print("EEMem not found")
+   return
+end
+
+local scanStart = ee + 0x45000000
+local scanEnd   = ee + 0x47000000
+
+local chunkSize = 0x100000
+local interval  = 50
+
+local function findPatternInBlock(base, bytes)
+  local plen = #pattern
+  local max = #bytes - plen + 1
+
+  for i = 1, max do
+    local ok = true
+
+    for j = 1, plen do
+      if bytes[i + j - 1] ~= pattern[j] then
+        ok = false
+        break
+      end
+    end
+
+    if ok then
+      return base + i - 1
+    end
+  end
+
+  return nil
+end
+
+local function inject(found)
+  local enableAA = string.format([[
+define(GetHit,%X)
+
+alloc(newmem,$1000,GetHit)
+
+label(return)
+label(DamageStore)
+label(HPStore)
+
+registersymbol(GetHit)
+registersymbol(DamageStore)
+registersymbol(HPStore)
+
+newmem:
+  push rax
+  mov eax,[rbp+rcx+00]
+  sub eax,r8d
+  mov [DamageStore],eax
+  pop rax
+
+  mov [rbp+rcx+00],r8d
+  mov [HPStore],r8d
+  jmp return
+
+DamageStore:
+  dd 0
+
+HPStore:
+  dd 0
+
+GetHit+01:
+  jmp newmem
+return:
+]], found)
+
+  _G.GetHitDisableAA = [[
+GetHit+01:
+  db 44 89 44 0D 00
+
+unregistersymbol(HPStore)
+unregistersymbol(DamageStore)
+unregistersymbol(GetHit)
+
+dealloc(newmem)
+]]
+
+  if autoAssemble(enableAA) then
+    _G.GetHitInjected = true
+    print(string.format("GetHit hook enabled at %X", found))
+    return true
+  end
+
+  print("GetHit injection failed")
+  return false
+end
+
+if _G.GetHitTimer then
+  _G.GetHitTimer.destroy()
+end
+
+_G.GetHitInjected = false
+_G.GetHitScanPos = scanStart
+
+_G.GetHitTimer = createTimer(nil, false)
+_G.GetHitTimer.Interval = interval
+
+_G.GetHitTimer.OnTimer = function(t)
+  t.Enabled = false
+
+  local pos = _G.GetHitScanPos
+  local readSize = chunkSize + #pattern
+  local percent =
+  ((pos - scanStart) / (scanEnd - scanStart)) * 100
+
+print(string.format(
+  "Scanning chunk: %X - %X (%.2f%%)",
+  pos,
+  pos + chunkSize,
+  percent
+))
+
+  local bytes = readBytes(pos, readSize, true)
+
+  if bytes then
+    local found = findPatternInBlock(pos, bytes)
+
+    if found then
+      print(string.format("Found GetHit at %X", found))
+
+      if inject(found) then
+        t.destroy()
+        _G.GetHitTimer = nil
+        return
+      end
+    end
+  end
+
+  _G.GetHitScanPos = pos + chunkSize
+
+  if _G.GetHitScanPos >= scanEnd then
+    _G.GetHitScanPos = scanStart
+    print("Restarting scan window")
+  end
+
+  if _G.GetHitTimer then
+    t.Enabled = true
+  end
+end
+
+_G.GetHitTimer.Enabled = true
+{$asm}
+
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+
+if _G.GetHitTimer then
+  _G.GetHitTimer.destroy()
+  _G.GetHitTimer = nil
+end
+
+if _G.GetHitInjected and _G.GetHitDisableAA then
+  autoAssemble(_G.GetHitDisableAA)
+end
+
+_G.GetHitInjected = false
+{$asm}
